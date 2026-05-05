@@ -57,7 +57,19 @@ export default function App() {
     const saved = localStorage.getItem('e_keuangan_data');
     if (saved) {
       try {
-        setTransactions(JSON.parse(saved));
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) {
+          // Date migration: Ensure all dates are in YYYY-MM-DD format if possible
+          const migrated = parsed.map(t => {
+            if (t.date && t.date.includes('/')) {
+              // Assume DD/MM/YYYY and convert to YYYY-MM-DD
+              const [d, m, y] = t.date.split('/');
+              if (d && m && y) return { ...t, date: `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}` };
+            }
+            return t;
+          });
+          setTransactions(migrated);
+        }
       } catch (e) {
         console.error("Failed to parse data", e);
       }
@@ -66,7 +78,13 @@ export default function App() {
 
   // Save data to localStorage
   useEffect(() => {
-    localStorage.setItem('e_keuangan_data', JSON.stringify(transactions));
+    try {
+      if (transactions.length > 0) {
+        localStorage.setItem('e_keuangan_data', JSON.stringify(transactions));
+      }
+    } catch (e) {
+      console.error("Failed to save to localStorage (Quota reached?):", e);
+    }
   }, [transactions]);
   
   const syncToSheets = async (transactionId: string, data: Transaction) => {
@@ -109,12 +127,15 @@ export default function App() {
     e.preventDefault();
     if (!formData.staff || !formData.amount) return;
 
+    const parsedAmount = parseFloat(formData.amount);
+    if (isNaN(parsedAmount)) return;
+
     const newTransaction: Transaction = {
-      id: Math.random().toString(36).substr(2, 9),
+      id: Date.now().toString(36) + Math.random().toString(36).substring(2, 11),
       date: new Date().toISOString().substring(0, 10),
       unit: formData.unit,
       staff: formData.staff,
-      amount: parseFloat(formData.amount),
+      amount: parsedAmount,
       type: formData.type,
       description: formData.description,
       createdAt: Date.now(),
@@ -122,10 +143,8 @@ export default function App() {
     };
 
     setTransactions(prev => [newTransaction, ...prev]);
-    setIsFormOpen(false);
     
-    syncToSheets(newTransaction.id, newTransaction);
-
+    // Clear form immediately
     setFormData({
       unit: 'Pasar',
       staff: '',
@@ -133,6 +152,14 @@ export default function App() {
       type: 'Pemasukan',
       description: ''
     });
+
+    // Close modal
+    setIsFormOpen(false);
+    
+    // Non-blocking sync with a small delay for smoother transition
+    setTimeout(() => {
+      syncToSheets(newTransaction.id, newTransaction).catch(err => console.error("Sync catch:", err));
+    }, 500);
   };
 
   // Calculations
@@ -168,13 +195,15 @@ export default function App() {
 
   // Filtered Transactions for List
   const filteredTransactions = useMemo(() => {
+    if (!Array.isArray(transactions)) return [];
     return transactions
       .filter(t => {
+        if (!t) return false;
         const matchesUnit = unitFilter === 'All' || t.unit === unitFilter;
-        const matchesMonth = t.date.startsWith(monthFilter);
+        const matchesMonth = t.date && typeof t.date === 'string' && t.date.startsWith(monthFilter);
         return matchesUnit && matchesMonth;
       })
-      .sort((a, b) => b.createdAt - a.createdAt);
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   }, [transactions, unitFilter, monthFilter]);
 
   const formatCurrency = (amount: number) => {
@@ -323,6 +352,19 @@ export default function App() {
             </div>
             
             <div className="flex flex-wrap items-center gap-2">
+              {transactions.some(t => !t.synced) && (
+                <button 
+                  onClick={() => {
+                    const unsynced = transactions.filter(t => !t.synced);
+                    unsynced.forEach((t, i) => {
+                      setTimeout(() => syncToSheets(t.id, t), i * 1000);
+                    });
+                  }}
+                  className="px-3 py-2 bg-amber-100 text-amber-700 rounded-lg text-xs font-bold hover:bg-amber-200 transition-all flex items-center gap-2"
+                >
+                  <History className="w-3 h-3" /> Sync All ({transactions.filter(t => !t.synced).length})
+                </button>
+              )}
               <div className="relative group">
                 <select 
                   value={monthFilter}
@@ -424,6 +466,27 @@ export default function App() {
           </div>
         </div>
       </main>
+
+      {/* Footer Info */}
+      <footer className="max-w-5xl mx-auto px-4 py-8 mb-10 border-t border-slate-200">
+        <div className="flex flex-col sm:flex-row justify-between items-center gap-4 text-slate-400 text-xs">
+          <p>© 2024 E-Keuangan Unit. Data tersimpan di HP Anda.</p>
+          <div className="flex gap-4">
+            <button 
+              onClick={() => {
+                if (window.confirm("Yakin ingin menghapus semua data di HP ini?")) {
+                  localStorage.removeItem('e_keuangan_data');
+                  window.location.reload();
+                }
+              }}
+              className="hover:text-rose-500 transition-colors"
+            >
+              Reset Semua Data
+            </button>
+            <p>Version 1.2.0</p>
+          </div>
+        </div>
+      </footer>
 
       {/* Input Modal */}
       <AnimatePresence>
