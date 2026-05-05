@@ -1,0 +1,6 @@
+{
+  "name": "E-Keuangan Unit (Pasar, Parkir, Hippam)",
+  "description": "Aplikasi manajemen keuangan harian untuk unit Pasar, Parkir, dan Hippam dengan laporan saldo mingguan dan bulanan.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
