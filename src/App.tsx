@@ -59,15 +59,19 @@ export default function App() {
       try {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed)) {
-          // Date migration: Ensure all dates are in YYYY-MM-DD format if possible
-          const migrated = parsed.map(t => {
-            if (t.date && t.date.includes('/')) {
-              // Assume DD/MM/YYYY and convert to YYYY-MM-DD
-              const [d, m, y] = t.date.split('/');
-              if (d && m && y) return { ...t, date: `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}` };
-            }
-            return t;
-          });
+          const migrated = parsed
+            .filter(t => t && typeof t === 'object')
+            .map(t => {
+              // Ensure essential fields exist
+              const date = t.date || new Date().toISOString().substring(0, 10);
+              const amount = typeof t.amount === 'number' ? t.amount : parseFloat(t.amount) || 0;
+              
+              if (date.includes('/')) {
+                const [d, m, y] = date.split('/');
+                if (d && m && y) return { ...t, date: `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`, amount };
+              }
+              return { ...t, date, amount, createdAt: t.createdAt || Date.now() };
+            });
           setTransactions(migrated);
         }
       } catch (e) {
@@ -79,11 +83,9 @@ export default function App() {
   // Save data to localStorage
   useEffect(() => {
     try {
-      if (transactions.length > 0) {
-        localStorage.setItem('e_keuangan_data', JSON.stringify(transactions));
-      }
+      localStorage.setItem('e_keuangan_data', JSON.stringify(transactions));
     } catch (e) {
-      console.error("Failed to save to localStorage (Quota reached?):", e);
+      console.error("Failed to save to localStorage:", e);
     }
   }, [transactions]);
   
@@ -164,25 +166,34 @@ export default function App() {
 
   // Calculations
   const calculations = useMemo(() => {
+    if (!Array.isArray(transactions)) {
+      return { totalIncome: 0, totalExpense: 0, balance: 0, weeklyBalance: 0, monthlyBalance: 0 };
+    }
+
     const now = new Date();
-    const oneWeekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    // Use string comparisons for more predictable filtering in dashboard
+    const todayStr = now.toISOString().substring(0, 10);
+    const monthStartStr = now.toISOString().substring(0, 7) + "-01";
+    
+    // One week ago string
+    const lastWeek = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const lastWeekStr = lastWeek.toISOString().substring(0, 10);
 
     const totalIncome = transactions
-      .filter(t => t.type === 'Pemasukan')
-      .reduce((sum, t) => sum + t.amount, 0);
+      .filter(t => t && t.type === 'Pemasukan')
+      .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
 
     const totalExpense = transactions
-      .filter(t => t.type === 'Pengeluaran')
-      .reduce((sum, t) => sum + t.amount, 0);
+      .filter(t => t && t.type === 'Pengeluaran')
+      .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
 
     const weeklyBalance = transactions
-      .filter(t => new Date(t.date) >= oneWeekAgo)
-      .reduce((sum, t) => sum + (t.type === 'Pemasukan' ? t.amount : -t.amount), 0);
+      .filter(t => t && t.date && t.date >= lastWeekStr)
+      .reduce((sum, t) => sum + (t.type === 'Pemasukan' ? (Number(t.amount) || 0) : -(Number(t.amount) || 0)), 0);
 
     const monthlyBalance = transactions
-      .filter(t => new Date(t.date) >= startOfMonth)
-      .reduce((sum, t) => sum + (t.type === 'Pemasukan' ? t.amount : -t.amount), 0);
+      .filter(t => t && t.date && t.date.startsWith(monthFilter))
+      .reduce((sum, t) => sum + (t.type === 'Pemasukan' ? (Number(t.amount) || 0) : -(Number(t.amount) || 0)), 0);
 
     return {
       totalIncome,
@@ -191,7 +202,7 @@ export default function App() {
       weeklyBalance,
       monthlyBalance
     };
-  }, [transactions]);
+  }, [transactions, monthFilter]);
 
   // Filtered Transactions for List
   const filteredTransactions = useMemo(() => {
@@ -206,12 +217,14 @@ export default function App() {
       .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   }, [transactions, unitFilter, monthFilter]);
 
-  const formatCurrency = (amount: number) => {
+  const formatCurrency = (amount: any) => {
+    const num = Number(amount);
+    if (isNaN(num)) return 'Rp 0';
     return new Intl.NumberFormat('id-ID', {
       style: 'currency',
       currency: 'IDR',
       minimumFractionDigits: 0
-    }).format(amount);
+    }).format(num);
   };
 
   return (
