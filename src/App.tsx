@@ -51,8 +51,63 @@ export default function App() {
 
   const SCRIPT_URL = import.meta.env.VITE_GOOGLE_SCRIPT_URL || '';
   const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'success' | 'error'>('idle');
+  const [isFetching, setIsFetching] = useState(false);
 
-  // Load data from localStorage
+  // Fetch data from Google Sheets
+  const fetchDataFromSheets = async () => {
+    if (!SCRIPT_URL) return;
+    setIsFetching(true);
+    try {
+      const response = await fetch(SCRIPT_URL);
+      const data = await response.json();
+      
+      if (Array.isArray(data)) {
+        const remoteTransactions = data
+          .filter(item => item && typeof item === 'object')
+          .map((item: any, index: number) => {
+            // Robust parsing for various date formats
+            let dateStr = String(item.date || '');
+            if (dateStr.includes('T')) dateStr = dateStr.split('T')[0];
+            
+            // Robust parsing for numeric amounts (handle dots/commas)
+            let rawAmount = item.amount;
+            let parsedAmount = 0;
+            if (typeof rawAmount === 'number') {
+              parsedAmount = rawAmount;
+            } else if (rawAmount) {
+              const cleaned = String(rawAmount).replace(/\./g, '').replace(/,/g, '.');
+              parsedAmount = parseFloat(cleaned) || 0;
+            }
+
+            return {
+              id: item.id || `remote-${index}-${Date.now()}`,
+              date: dateStr || new Date().toISOString().substring(0, 10),
+              unit: (item.unit || 'Pasar') as UnitType,
+              staff: item.staff || '',
+              amount: parsedAmount,
+              type: (item.type || 'Pemasukan') as TransactionType,
+              description: item.description || '',
+              createdAt: Date.now() - index,
+              synced: true
+            };
+          });
+        
+        // Merge with local: priority to local unsynced
+        setTransactions(prev => {
+          const unsynced = prev.filter(t => !t.synced);
+          const remoteIds = new Set(remoteTransactions.map(rt => rt.id));
+          const uniqueUnsynced = unsynced.filter(t => !remoteIds.has(t.id));
+          return [...uniqueUnsynced, ...remoteTransactions];
+        });
+      }
+    } catch (error) {
+      console.error("Gagal mengambil data:", error);
+    } finally {
+      setIsFetching(false);
+    }
+  };
+
+  // Load data from localStorage and then Sheets
   useEffect(() => {
     const saved = localStorage.getItem('e_keuangan_data');
     if (saved) {
@@ -62,14 +117,8 @@ export default function App() {
           const migrated = parsed
             .filter(t => t && typeof t === 'object')
             .map(t => {
-              // Ensure essential fields exist
               const date = t.date || new Date().toISOString().substring(0, 10);
               const amount = typeof t.amount === 'number' ? t.amount : parseFloat(t.amount) || 0;
-              
-              if (date.includes('/')) {
-                const [d, m, y] = date.split('/');
-                if (d && m && y) return { ...t, date: `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`, amount };
-              }
               return { ...t, date, amount, createdAt: t.createdAt || Date.now() };
             });
           setTransactions(migrated);
@@ -78,6 +127,9 @@ export default function App() {
         console.error("Failed to parse data", e);
       }
     }
+    
+    // Auto fetch from sheets on mount
+    fetchDataFromSheets();
   }, []);
 
   // Save data to localStorage
@@ -127,26 +179,30 @@ export default function App() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formData.staff || !formData.amount) return;
+    
+    // Validate
+    const staffName = formData.staff.trim();
+    const amountStr = String(formData.amount).trim();
+    if (!staffName || !amountStr) return;
 
-    const parsedAmount = parseFloat(formData.amount);
+    const parsedAmount = parseFloat(amountStr);
     if (isNaN(parsedAmount)) return;
 
+    const newTransactionId = Date.now().toString(36) + Math.random().toString(36).substring(2, 11);
     const newTransaction: Transaction = {
-      id: Date.now().toString(36) + Math.random().toString(36).substring(2, 11),
+      id: newTransactionId,
       date: new Date().toISOString().substring(0, 10),
       unit: formData.unit,
-      staff: formData.staff,
+      staff: staffName,
       amount: parsedAmount,
       type: formData.type,
-      description: formData.description,
+      description: formData.description.trim(),
       createdAt: Date.now(),
       synced: false
     };
 
-    setTransactions(prev => [newTransaction, ...prev]);
-    
-    // Clear form immediately
+    // 1. Close modal and reset form FIRST to avoid UI hang/white screen
+    setIsFormOpen(false);
     setFormData({
       unit: 'Pasar',
       staff: '',
@@ -155,13 +211,15 @@ export default function App() {
       description: ''
     });
 
-    // Close modal
-    setIsFormOpen(false);
+    // 2. Update local state
+    setTransactions(prev => [newTransaction, ...prev]);
     
-    // Non-blocking sync with a small delay for smoother transition
+    // 3. Sync to sheets after UI is ready
     setTimeout(() => {
-      syncToSheets(newTransaction.id, newTransaction).catch(err => console.error("Sync catch:", err));
-    }, 500);
+      syncToSheets(newTransactionId, newTransaction).catch(err => {
+        console.error("Delayed sync catch:", err);
+      });
+    }, 600);
   };
 
   // Calculations
@@ -171,29 +229,37 @@ export default function App() {
     }
 
     const now = new Date();
-    // Use string comparisons for more predictable filtering in dashboard
     const todayStr = now.toISOString().substring(0, 10);
-    const monthStartStr = now.toISOString().substring(0, 7) + "-01";
+    const monthPrefix = monthFilter; // YYYY-MM
     
-    // One week ago string
     const lastWeek = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     const lastWeekStr = lastWeek.toISOString().substring(0, 10);
 
-    const totalIncome = transactions
-      .filter(t => t && t.type === 'Pemasukan')
-      .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+    let totalIncome = 0;
+    let totalExpense = 0;
+    let weeklyBalance = 0;
+    let monthlyBalance = 0;
 
-    const totalExpense = transactions
-      .filter(t => t && t.type === 'Pengeluaran')
-      .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+    transactions.forEach(t => {
+      if (!t) return;
+      const amount = Number(t.amount) || 0;
+      const date = String(t.date || '');
+      
+      if (t.type === 'Pemasukan') {
+        totalIncome += amount;
+      } else if (t.type === 'Pengeluaran') {
+        totalExpense += amount;
+      }
 
-    const weeklyBalance = transactions
-      .filter(t => t && t.date && t.date >= lastWeekStr)
-      .reduce((sum, t) => sum + (t.type === 'Pemasukan' ? (Number(t.amount) || 0) : -(Number(t.amount) || 0)), 0);
-
-    const monthlyBalance = transactions
-      .filter(t => t && t.date && t.date.startsWith(monthFilter))
-      .reduce((sum, t) => sum + (t.type === 'Pemasukan' ? (Number(t.amount) || 0) : -(Number(t.amount) || 0)), 0);
+      // Check dates safely
+      if (date >= lastWeekStr) {
+        weeklyBalance += (t.type === 'Pemasukan' ? amount : -amount);
+      }
+      
+      if (date.startsWith(monthPrefix)) {
+        monthlyBalance += (t.type === 'Pemasukan' ? amount : -amount);
+      }
+    });
 
     return {
       totalIncome,
@@ -245,6 +311,16 @@ export default function App() {
             <Plus className="w-5 h-5" />
             <span className="hidden sm:inline font-medium">Input Data</span>
           </button>
+          {SCRIPT_URL && (
+            <button 
+              onClick={fetchDataFromSheets}
+              disabled={isFetching}
+              className="p-2 text-slate-500 hover:bg-slate-100 rounded-full transition-colors"
+              title="Refresh dari Google Sheets"
+            >
+              <History className={`w-5 h-5 ${isFetching ? 'animate-spin' : ''}`} />
+            </button>
+          )}
         </div>
       </header>
 
@@ -654,26 +730,45 @@ export default function App() {
     </div>
   );
 }
-
   /** 
-  * KODE GOOGLE APPS SCRIPT (GAS) - VERSI REVISI (PASTI JALAN):
+  * KODE GOOGLE APPS SCRIPT (GAS) - VERSI FETCH (READ + WRITE):
   * ---------------------------------------------------------
-  * 1. Buka spreadsheet: https://docs.google.com/spreadsheets/d/1gk2f0yIMr2nzX_CI9H_oktltm8TV6A8T2qILRvzl6lc/edit
+  * 1. Buka spreadsheet Anda.
   * 2. Klik 'Extensions' -> 'Apps Script'.
   * 3. Hapus SEMUA kode lama, ganti dengan ini:
   *
   * function doGet(e) {
-  *   return ContentService.createTextOutput("Koneksi Berhasil!").setMimeType(ContentService.MimeType.TEXT);
+  *   try {
+  *     var ss = SpreadsheetApp.getActiveSpreadsheet();
+  *     var sheet = ss.getSheets()[0];
+  *     var data = sheet.getDataRange().getValues();
+  *     var jsonData = [];
+  *     for (var i = 1; i < data.length; i++) {
+  *       var row = data[i];
+  *       if (!row[0] && !row[1]) continue; // Skip baris kosong
+  *       jsonData.push({
+  *         id: row[7] || "legacy-" + i, 
+  *         date: row[0],
+  *         unit: row[1],
+  *         staff: row[2],
+  *         amount: row[3],
+  *         type: row[4],
+  *         description: row[5]
+  *       });
+  *     }
+  *     return ContentService.createTextOutput(JSON.stringify(jsonData.reverse().slice(0, 300)))
+  *       .setMimeType(ContentService.MimeType.JSON);
+  *   } catch (err) {
+  *     return ContentService.createTextOutput("[]").setMimeType(ContentService.MimeType.JSON);
+  *   }
   * }
   *
   * function doPost(e) {
   *   try {
   *     var ss = SpreadsheetApp.getActiveSpreadsheet();
   *     var sheet = ss.getSheets()[0];
-  *     var contents = e.postData.contents;
-  *     var data = JSON.parse(contents);
-  *     
-  *     // Mapping data ke kolom (Sesuaikan urutan ini jika Anda merubah header di Sheets)
+  *     var data = JSON.parse(e.postData.contents);
+  *     // Mapping: [Tanggal, Unit, Petugas, Jumlah, Tipe, Keterangan, Waktu Input, ID]
   *     sheet.appendRow([
   *       data.date, 
   *       data.unit, 
@@ -681,13 +776,11 @@ export default function App() {
   *       data.amount, 
   *       data.type, 
   *       data.description, 
-  *       new Date() // Waktu Input
+  *       new Date(),
+  *       data.id
   *     ]);
-  *     
-  *     return ContentService.createTextOutput("Berhasil").setMimeType(ContentService.MimeType.TEXT);
+  *     return ContentService.createTextOutput("Success").setMimeType(ContentService.MimeType.TEXT);
   *   } catch (err) {
-  *     // Catat error ke baris terakhir jika gagal
-  *     SpreadsheetApp.getActiveSpreadsheet().getSheets()[0].appendRow(["ERROR LOG: " + err.message, new Date()]);
   *     return ContentService.createTextOutput(err.toString()).setMimeType(ContentService.MimeType.TEXT);
   *   }
   * }
@@ -696,9 +789,7 @@ export default function App() {
   * 5. Pilih 'Web App'.
   * 6. Execute as: 'Me'.
   * 7. Who has access: 'Anyone'.
-  * 8. Klik 'Deploy'. JIka ada popup 'Authorize Access', klik 'Review Permissions' -> 'Pilih Email' -> 'Advanced' -> 'Go to... (unsafe)' -> 'Allow'.
-  * 9. COPY 'Web App URL' yang baru (biasanya diakhiri /exec).
-  * 10. Jika Anda mengupdate kode, Anda WAJIB membuat 'New Deployment' lagi atau memilih 'Manage Deployments' dan naikkan versinya.
-  * 11. Masukkan URL tersebut ke menu 'Secrets' (icon kunci) di AI Studio dengan nama: VITE_GOOGLE_SCRIPT_URL
+  * 8. Jika muncul Authorize Access, klik 'Review Permissions' -> Akun Google -> 'Advanced' -> 'Go to...' -> 'Allow'.
+  * 9. COPY URL Web App dan masukkan ke menu Secrets (VITE_GOOGLE_SCRIPT_URL).
   */
 
